@@ -1,15 +1,3 @@
-Perfect — I’ll give you a **professional, publication-quality `README.md`** suitable for:
-
-✔ GitHub
-✔ Paper reproducibility
-✔ Reviewer inspection
-✔ Dataset clarity (with your references [34–37])
-
----
-
-# ✅ ✅ FINAL `README.md` (USE THIS)
-
-```markdown
 # Adaptive Saliency-Guided Signal Representation (ASGSR) for Brain Tumor MRI Classification
 
 ## 📌 Overview
@@ -52,7 +40,7 @@ ASGSR-MRI-Classification/
 ├── evaluate.py            # Evaluation script
 ├── config.py              # Configuration file
 ├── requirements.txt       # Dependencies
-└── figures/               # Output figures
+
 
 ````
 
@@ -124,7 +112,6 @@ The framework is evaluated on multiple publicly available brain MRI datasets:
 ## 📂 Dataset Structure
 
 ```
-
 data/
 ├── train/
 │   ├── Glioma/
@@ -138,7 +125,6 @@ data/
 │   └── No\_Tumor/
 
 ```
-
 ---
 
 ## 🚀 Usage
@@ -148,7 +134,6 @@ data/
 ```bash
 python train.py
 ```
-
 ---
 
 ### 🔹 Evaluate Model
@@ -209,26 +194,6 @@ The ASGSR framework demonstrates that:
 
 ---
 
-## 📚 References
-
-```
-
-[34] Nickparvar, M. (2021). Brain Tumor MRI Dataset. Kaggle.  
-https://www.kaggle.com/datasets/masoudnickparvar/brain-tumor-mri-dataset  
-
-[35] Hira, M. I. K., et al. (2025). Brain Tumor MRI Dataset. Mendeley Data.  
-https://doi.org/10.17632/zwr4ntf94j.5  
-
-[36] Fateh, A., et al. (2025). BRISC Dataset. Kaggle.  
-https://www.kaggle.com/datasets/briscdataset/brisc2025/  
-
-[37] Cheng, J. (2015). Brain Tumor Dataset. Figshare.  
-https://figshare.com/articles/dataset/brain_tumor_dataset/1512427  
-
-```
-
----
-
 ## 📌 Citation
 
 If you use this work, please cite:
@@ -237,20 +202,12 @@ If you use this work, please cite:
 
 @article{asg sr2026,
 title={Adaptive Saliency-Guided Signal Representation for Robust Brain Tumor MRI Classification},
-author={Your Name},
-journal={Biomedical Signal Processing and Control},
+author={},
+journal={},
 year={2026}
 }
 
 ```
-
----
-
-## 👨‍💻 Author
-
-**Indrakumar K**
-Researcher in Biomedical Signal Processing & AI
-
 ---
 
 ## 📄 License
@@ -267,26 +224,9 @@ This repository provides a **signal-processing-driven alternative to deep learni
 * Interpretability
 * Structured signal modeling
 
-👉 Suitable for research, publication, and clinical AI development.
-
 ```
 
 ---
-
-# 🏁 FINAL RESULT
-
-✔ Professional GitHub README  
-✔ Reviewer-ready  
-✔ Dataset links included  
-✔ Matches your paper  
-✔ Strong research positioning  
-
----
-
-# 🚀 OPTIONAL FINAL UPGRADE
-
-If you want:
-👉 **“make GitHub repo premium (badges + demo + screenshots)”**
 
 I’ll add:
 - badges  
