@@ -225,14 +225,3 @@ This repository provides a **signal-processing-driven alternative to deep learni
 * Structured signal modeling
 
 ```
-
----
-
-I’ll add:
-- badges  
-- results images  
-- clean visuals  
-- citation badge  
-
-👉 makes your repo look **top-tier research quality**
-```
