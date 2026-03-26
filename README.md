@@ -69,7 +69,7 @@ The framework is evaluated on multiple publicly available brain MRI datasets:
 
 ---
 
-### 🔹 1. Nickparvar Dataset [34]
+### 🔹 1. Nickparvar Dataset
 
 * 6,920 MRI images
 * Classes: Glioma, Meningioma, Pituitary, Normal
@@ -79,7 +79,7 @@ The framework is evaluated on multiple publicly available brain MRI datasets:
 
 ---
 
-### 🔹 2. Epic & CSCR Dataset (Mendeley) [35]
+### 🔹 2. Epic & CSCR Dataset (Mendeley)
 
 * 12,064 contrast-enhanced T1 MRI images
 * 4 classes with train/test split
@@ -89,7 +89,7 @@ The framework is evaluated on multiple publicly available brain MRI datasets:
 
 ---
 
-### 🔹 3. BRISC Dataset [36]
+### 🔹 3. BRISC Dataset
 
 * ~6,000 MRI images
 * Multi-scanner variability
@@ -99,7 +99,7 @@ The framework is evaluated on multiple publicly available brain MRI datasets:
 
 ---
 
-### 🔹 4. Figshare Dataset [37]
+### 🔹 4. Figshare Dataset
 
 * 2,980 MRI images
 * Classes: Glioma, Meningioma, Pituitary
