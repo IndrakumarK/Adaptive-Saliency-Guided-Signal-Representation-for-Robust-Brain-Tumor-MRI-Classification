@@ -1,70 +1,140 @@
+```python
 """
 Configuration file for ASGSR MRI Classification
 """
 
-# -------------------------------------------------
+# =================================================
 # DATA CONFIGURATION
-# -------------------------------------------------
-DATA_ROOT = "./data"          # Root dataset folder
-IMG_SIZE = 224                # Input image size
-NUM_CLASSES = 4               # Glioma, Meningioma, Pituitary, Normal
+# =================================================
 
-# -------------------------------------------------
+DATA_ROOT = "./data"
+
+# Input MRI image size
+IMG_SIZE = 224
+
+# Number of classification categories
+# Glioma, Meningioma, Pituitary, Normal
+NUM_CLASSES = 4
+
+
+# =================================================
 # TRAINING CONFIGURATION
-# -------------------------------------------------
+# =================================================
+
 BATCH_SIZE = 16
+
 EPOCHS = 100
+
 LEARNING_RATE = 1e-4
+
 WEIGHT_DECAY = 1e-5
 
-DEVICE = "cuda"               # "cuda" or "cpu"
+DEVICE = "cuda"       # "cuda" or "cpu"
+
 NUM_WORKERS = 4
 
-# -------------------------------------------------
-# MODEL CONFIGURATION (Saliency CNN)
-# -------------------------------------------------
+
+# =================================================
+# MODEL CONFIGURATION
+# =================================================
+
+# Number of channels in the Saliency CNN
 CNN_CHANNELS = [32, 64, 128, 256]
 
-# -------------------------------------------------
-# ASGSR SIGNAL PARAMETERS
-# -------------------------------------------------
-NUM_RESOLUTION_LEVELS = 3     # K in paper
-BETA = 0.1                   # Saliency smoothness weight
-LAMBDA_REG = 1e-4            # Regularization (?1)
-LAMBDA_CONF = 1e-3           # Confidence penalty (?2)
+
+# =================================================
+# ASGSR SIGNAL REPRESENTATION PARAMETERS
+# =================================================
+
+# Number of multi-resolution decomposition levels
+# K in the manuscript
+NUM_RESOLUTION_LEVELS = 4
 
 # -------------------------------------------------
-# BAYESIAN CLASSIFIER
+# Saliency smoothness parameter
 # -------------------------------------------------
-USE_DIAGONAL_COV = False     # Optional speed optimization
+# β controls the contribution of the saliency
+# smoothness term in the formulation.
+BETA = 0.1
 
 # -------------------------------------------------
-# EVALUATION SETTINGS
+# Regularization parameter
 # -------------------------------------------------
+# λ1 controls the regularization term.
+LAMBDA_REG = 1e-4
+
+# -------------------------------------------------
+# Confidence penalty parameter
+# -------------------------------------------------
+# λ2 controls the confidence-related penalty.
+LAMBDA_CONF = 1e-3
+
+
+# =================================================
+# BAYESIAN CLASSIFIER CONFIGURATION
+# =================================================
+
+# False -> full covariance matrix
+# True  -> diagonal covariance matrix
+USE_DIAGONAL_COV = False
+
+
+# =================================================
+# EVALUATION CONFIGURATION
+# =================================================
+
+# Number of folds for cross-validation
 K_FOLDS = 5
+
+# Enable cross-dataset evaluation
 USE_CROSS_DATASET = True
 
-# -------------------------------------------------
+
+# =================================================
 # NOISE ROBUSTNESS TESTING
-# -------------------------------------------------
+# =================================================
+
 ENABLE_NOISE_TEST = True
 
-GAUSSIAN_NOISE_STD = [0.01, 0.05, 0.1]
-RICIAN_NOISE_STD = [0.01, 0.05, 0.1]
-BIAS_FIELD_STRENGTH = [0.1, 0.2]
+# Gaussian noise standard deviations
+GAUSSIAN_NOISE_STD = [
+    0.01,
+    0.05,
+    0.10
+]
 
-# -------------------------------------------------
-# OUTPUT SETTINGS
-# -------------------------------------------------
+# Rician noise standard deviations
+RICIAN_NOISE_STD = [
+    0.01,
+    0.05,
+    0.10
+]
+
+# Bias-field strengths
+BIAS_FIELD_STRENGTH = [
+    0.10,
+    0.20
+]
+
+
+# =================================================
+# OUTPUT CONFIGURATION
+# =================================================
+
 SAVE_MODEL = True
+
 MODEL_PATH = "./checkpoints/model.pth"
 
 SAVE_FIGURES = True
+
 FIGURE_PATH = "./figures/"
 
 LOG_INTERVAL = 10
 
-# -------------------------------------------------
-# RANDOM SEED (REPRODUCIBILITY)
-# -------------------------------------------------
+
+# =================================================
+# REPRODUCIBILITY
+# =================================================
+
 SEED = 42
+```
