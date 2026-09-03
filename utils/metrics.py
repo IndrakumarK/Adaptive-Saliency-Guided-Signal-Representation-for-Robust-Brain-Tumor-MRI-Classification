@@ -1,100 +1,366 @@
 import numpy as np
+import torch
+from torch.utils.data import DataLoader
+
+import config
+from data.dataset import MRIDataset
+from models import (
+    SaliencyCNN,
+    ASGSRPipeline,
+    BayesianClassifier
+)
+
+from utils.metrics import (
+    compute_psnr,
+    compute_ssim,
+    compute_snr,
+    compute_edge_preservation
+)
+
+from utils import (
+    plot_confusion_matrix,
+    plot_roc_curve
+)
 
 
 # -------------------------------------------------
-# 1. PSNR (Peak Signal-to-Noise Ratio)
+# LOAD TRAINED SALIENCY CNN
 # -------------------------------------------------
-def compute_psnr(original, filtered, max_val=1.0):
-    """
-    Compute PSNR between original and filtered image
-    """
-    original = original.astype(np.float32)
-    filtered = filtered.astype(np.float32)
-
-    mse = np.mean((original - filtered) ** 2)
-
-    if mse == 0:
-        return float("inf")
-
-    psnr = 10 * np.log10((max_val ** 2) / (mse + 1e-8))
-    return psnr
-
-
-# -------------------------------------------------
-# 2. SSIM (Structural Similarity Index)
-# -------------------------------------------------
-def compute_ssim(img1, img2):
-    """
-    Simplified SSIM implementation (global)
-    """
-    img1 = img1.astype(np.float32)
-    img2 = img2.astype(np.float32)
-
-    C1 = 0.01 ** 2
-    C2 = 0.03 ** 2
-
-    mu1 = np.mean(img1)
-    mu2 = np.mean(img2)
-
-    sigma1 = np.var(img1)
-    sigma2 = np.var(img2)
-
-    covariance = np.mean((img1 - mu1) * (img2 - mu2))
-
-    ssim = (
-        (2 * mu1 * mu2 + C1) * (2 * covariance + C2)
-    ) / (
-        (mu1 ** 2 + mu2 ** 2 + C1) *
-        (sigma1 + sigma2 + C2)
+def load_model(device):
+    model = SaliencyCNN(
+        num_classes=config.NUM_CLASSES
     )
 
-    return ssim
+    model.load_state_dict(
+        torch.load(
+            config.MODEL_PATH,
+            map_location=device
+        )
+    )
+
+    model = model.to(device)
+    model.eval()
+
+    return model
 
 
 # -------------------------------------------------
-# 3. SNR (Signal-to-Noise Ratio)
+# FEATURE EXTRACTION + SIGNAL METRICS
 # -------------------------------------------------
-def compute_snr(original, filtered):
-    """
-    SNR = 10 log10 (||Is||^2 / ||I - Is||^2)
-    """
-    original = original.astype(np.float32)
-    filtered = filtered.astype(np.float32)
+def extract_features(loader, pipeline):
 
-    signal_power = np.sum(filtered ** 2)
-    noise_power = np.sum((original - filtered) ** 2)
+    features = []
+    labels = []
 
-    if noise_power == 0:
-        return float("inf")
+    psnr_list = []
+    ssim_list = []
+    snr_list = []
+    edge_list = []
 
-    snr = 10 * np.log10(signal_power / (noise_power + 1e-8))
-    return snr
+    for images, y in loader:
+
+        images = images.to(
+            pipeline.device
+        )
+
+        for i in range(images.shape[0]):
+
+            # -------------------------------------
+            # ORIGINAL MRI
+            # -------------------------------------
+            img = (
+                images[i]
+                .detach()
+                .cpu()
+                .numpy()
+                .transpose(1, 2, 0)
+            )
+
+            # Tensor for saliency computation
+            tensor = images[i].unsqueeze(0)
+
+            # -------------------------------------
+            # ASGSR PROCESSING
+            # -------------------------------------
+            feat, saliency = pipeline.process(
+                img,
+                tensor
+            )
+
+            # -------------------------------------
+            # SALIENCY-GUIDED REPRESENTATION
+            # -------------------------------------
+            filtered = (
+                img
+                * np.expand_dims(
+                    saliency,
+                    axis=-1
+                )
+            )
+
+            # -------------------------------------
+            # SIGNAL-LEVEL METRICS
+            # -------------------------------------
+            psnr_value = compute_psnr(
+                img,
+                filtered
+            )
+
+            ssim_value = compute_ssim(
+                img,
+                filtered
+            )
+
+            snr_value = compute_snr(
+                img,
+                filtered
+            )
+
+            edge_value = compute_edge_preservation(
+                img,
+                filtered
+            )
+
+            # -------------------------------------
+            # STORE METRICS
+            # -------------------------------------
+            psnr_list.append(psnr_value)
+            ssim_list.append(ssim_value)
+            snr_list.append(snr_value)
+            edge_list.append(edge_value)
+
+            # -------------------------------------
+            # STORE FEATURES
+            # -------------------------------------
+            features.append(feat)
+            labels.append(
+                y[i].item()
+            )
+
+    return (
+        np.array(features),
+        np.array(labels),
+        np.mean(psnr_list),
+        np.mean(ssim_list),
+        np.mean(snr_list),
+        np.mean(edge_list)
+    )
 
 
 # -------------------------------------------------
-# 4. CONFIDENCE SCORE (Entropy-based)
+# MAIN EVALUATION
 # -------------------------------------------------
-def compute_confidence_score(probs):
-    """
-    C(f) = 1 - H(P) / log(|C|)
-    
-    probs: shape (num_classes,)
-    """
-    probs = np.array(probs)
-    eps = 1e-8
+def evaluate():
 
-    entropy = -np.sum(probs * np.log(probs + eps))
-    max_entropy = np.log(len(probs))
+    # ---------------------------------------------
+    # DEVICE
+    # ---------------------------------------------
+    device = torch.device(
+        config.DEVICE
+        if torch.cuda.is_available()
+        else "cpu"
+    )
 
-    confidence = 1 - (entropy / (max_entropy + eps))
-    return confidence
+    print(
+        f"Using device: {device}"
+    )
+
+    # ---------------------------------------------
+    # DATASETS
+    # ---------------------------------------------
+    train_dataset = MRIDataset(
+        config.DATA_ROOT,
+        split="train",
+        img_size=config.IMG_SIZE
+    )
+
+    test_dataset = MRIDataset(
+        config.DATA_ROOT,
+        split="test",
+        img_size=config.IMG_SIZE
+    )
+
+    # ---------------------------------------------
+    # DATA LOADERS
+    # ---------------------------------------------
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=1,
+        shuffle=False
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=1,
+        shuffle=False
+    )
+
+    # ---------------------------------------------
+    # LOAD TRAINED SALIENCY CNN
+    # ---------------------------------------------
+    print(
+        "\nLoading trained Saliency CNN..."
+    )
+
+    model = load_model(device)
+
+    # ---------------------------------------------
+    # CREATE ASGSR PIPELINE
+    # ---------------------------------------------
+    pipeline = ASGSRPipeline(
+        model,
+        device=device
+    )
+
+    # ---------------------------------------------
+    # TRAIN FEATURES
+    # ---------------------------------------------
+    print(
+        "\nExtracting TRAIN features..."
+    )
+
+    (
+        X_train,
+        y_train,
+        _,
+        _,
+        _,
+        _
+    ) = extract_features(
+        train_loader,
+        pipeline
+    )
+
+    print(
+        f"Training feature shape: "
+        f"{X_train.shape}"
+    )
+
+    # ---------------------------------------------
+    # TEST FEATURES
+    # ---------------------------------------------
+    print(
+        "\nExtracting TEST features..."
+    )
+
+    (
+        X_test,
+        y_test,
+        psnr,
+        ssim,
+        snr,
+        edge_preservation
+    ) = extract_features(
+        test_loader,
+        pipeline
+    )
+
+    print(
+        f"Testing feature shape: "
+        f"{X_test.shape}"
+    )
+
+    # ---------------------------------------------
+    # BAYESIAN CLASSIFIER
+    # ---------------------------------------------
+    print(
+        "\nTraining Bayesian Classifier..."
+    )
+
+    classifier = BayesianClassifier()
+
+    classifier.fit(
+        X_train,
+        y_train
+    )
+
+    # ---------------------------------------------
+    # PREDICTION
+    # ---------------------------------------------
+    y_pred, confidence, probs = (
+        classifier.predict_with_confidence(
+            X_test
+        )
+    )
+
+    # ---------------------------------------------
+    # CLASSIFICATION ACCURACY
+    # ---------------------------------------------
+    accuracy = np.mean(
+        y_pred == y_test
+    )
+
+    # ---------------------------------------------
+    # RESULTS
+    # ---------------------------------------------
+    print(
+        "\n===================================="
+    )
+
+    print(
+        "        ASGSR EVALUATION RESULTS"
+    )
+
+    print(
+        "===================================="
+    )
+
+    print(
+        f"Accuracy           : "
+        f"{accuracy * 100:.2f}%"
+    )
+
+    print(
+        f"PSNR               : "
+        f"{psnr:.2f} dB"
+    )
+
+    print(
+        f"SSIM               : "
+        f"{ssim:.3f}"
+    )
+
+    print(
+        f"SNR                : "
+        f"{snr:.2f} dB"
+    )
+
+    print(
+        f"Edge Preservation  : "
+        f"{edge_preservation:.3f}"
+    )
+
+    print(
+        f"Average Confidence : "
+        f"{np.mean(confidence):.3f}"
+    )
+
+    print(
+        "===================================="
+    )
+
+    # ---------------------------------------------
+    # VISUALIZATION
+    # ---------------------------------------------
+    class_names = (
+        test_dataset.get_class_names()
+    )
+
+    plot_confusion_matrix(
+        y_test,
+        y_pred,
+        class_names
+    )
+
+    plot_roc_curve(
+        y_test,
+        probs,
+        config.NUM_CLASSES
+    )
 
 
 # -------------------------------------------------
-# 5. BATCH CONFIDENCE (OPTIONAL)
+# RUN
 # -------------------------------------------------
-def compute_batch_confidence(probs_batch):
-    """
-    probs_batch: (N, num_classes)
-    """
-    return np.array([compute_confidence_score(p) for p in probs_batch])
+if __name__ == "__main__":
+    evaluate()
