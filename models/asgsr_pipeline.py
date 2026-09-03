@@ -1,7 +1,7 @@
+```python
 import numpy as np
 import cv2
 import torch
-import torch.nn.functional as F
 
 
 class ASGSRPipeline:
@@ -9,17 +9,17 @@ class ASGSRPipeline:
     Adaptive Saliency-Guided Signal Representation (ASGSR)
 
     Pipeline:
-    1. Saliency estimation (gradient-based)
-    2. Adaptive filtering
-    3. Multi-resolution decomposition
+    1. Predicted-class saliency estimation
+    2. Adaptive spatial filtering
+    3. Multi-resolution signal decomposition
     4. Statistical feature extraction
+
+    The ground-truth class is NOT required during inference.
+    Saliency is computed with respect to the class predicted
+    by the trained saliency-estimation CNN.
     """
 
     def __init__(self, model, device="cpu", num_levels=3):
-        """
-        model: Saliency CNN used for gradient-based
-               signal sensitivity estimation
-        """
         self.model = model
         self.device = device
         self.num_levels = num_levels
@@ -28,149 +28,181 @@ class ASGSRPipeline:
         self.model.eval()
 
     # -------------------------------------------------
-    # 1. SALIENCY ESTIMATION
+    # 1. PREDICTED-CLASS SALIENCY ESTIMATION
     # -------------------------------------------------
     def compute_saliency(self, image_tensor):
         """
-        Compute gradient-based saliency map with respect
-        to the predicted class.
+        Compute gradient-based saliency with respect to
+        the predicted class.
 
-        Parameters
-        ----------
-        image_tensor : torch.Tensor
-            Input tensor of shape (1, C, H, W)
-
-        Returns
-        -------
-        saliency : numpy.ndarray
-            Normalized saliency map in the range [0, 1]
+        Ground-truth labels are NOT used.
         """
 
-        # Create an independent tensor for gradient computation
-        image_tensor = image_tensor.clone().detach().to(self.device)
+        image_tensor = (
+            image_tensor.clone()
+            .detach()
+            .to(self.device)
+        )
+
         image_tensor.requires_grad_(True)
 
-        # Forward pass through the trained saliency CNN
+        # Forward pass
         output = self.model(image_tensor)
 
-        # Determine the predicted class
-        predicted_class = torch.argmax(output, dim=1)
+        # Predicted class
+        predicted_class = torch.argmax(
+            output,
+            dim=1
+        )
 
-        # Select the score corresponding to the predicted class
-        score = output[0, predicted_class[0]]
+        # Score of predicted class
+        score = output[
+            0,
+            predicted_class[0]
+        ]
 
-        # Clear previously accumulated gradients
+        # Clear model gradients
         self.model.zero_grad()
 
-        # Compute gradient of the predicted-class score
-        # with respect to the input image
+        # Gradient of predicted-class score
         score.backward()
 
-        # Absolute gradient represents signal sensitivity
-        saliency = image_tensor.grad.detach().abs()
+        # Absolute input gradient
+        saliency = (
+            image_tensor.grad
+            .detach()
+            .abs()
+        )
 
-        # Aggregate gradients across image channels
-        saliency, _ = torch.max(saliency, dim=1)
+        # Aggregate channels
+        saliency, _ = torch.max(
+            saliency,
+            dim=1
+        )
 
         # Convert to NumPy
-        saliency = saliency.squeeze().cpu().numpy()
+        saliency = (
+            saliency
+            .squeeze()
+            .cpu()
+            .numpy()
+        )
 
-        # Normalize saliency map to [0, 1]
+        # Normalize saliency to [0, 1]
         saliency_min = saliency.min()
         saliency_max = saliency.max()
 
         if saliency_max > saliency_min:
             saliency = (
                 saliency - saliency_min
-            ) / (saliency_max - saliency_min)
+            ) / (
+                saliency_max - saliency_min
+            )
         else:
-            saliency = np.zeros_like(saliency)
+            saliency = np.zeros_like(
+                saliency,
+                dtype=np.float32
+            )
 
-        return saliency
+        return saliency.astype(np.float32)
 
     # -------------------------------------------------
-    # 2. ADAPTIVE FILTERING
+    # 2. ADAPTIVE SALIENCY-GUIDED FILTERING
     # -------------------------------------------------
-    def apply_saliency_filter(self, image, saliency):
+    def apply_saliency_filter(
+        self,
+        image,
+        saliency
+    ):
         """
-        Apply saliency-guided spatial weighting to the MRI signal.
+        Apply normalized saliency as a spatial
+        weighting function.
 
-        Parameters
-        ----------
-        image : numpy.ndarray
-            MRI image of shape (H, W, C)
-
-        saliency : numpy.ndarray
-            Saliency map of shape (H, W)
-
-        Returns
-        -------
-        filtered : numpy.ndarray
-            Saliency-weighted MRI signal
+        Since saliency is normalized to [0,1],
+        the filtering operation is energy-bounded.
         """
 
-        if len(image.shape) == 3:
-            saliency = np.expand_dims(saliency, axis=-1)
+        image = np.asarray(
+            image,
+            dtype=np.float32
+        )
 
+        saliency = np.asarray(
+            saliency,
+            dtype=np.float32
+        )
+
+        # Expand saliency for multi-channel images
+        if image.ndim == 3:
+            saliency = np.expand_dims(
+                saliency,
+                axis=-1
+            )
+
+        # Spatially weighted representation
         filtered = image * saliency
 
-        return filtered
+        return filtered.astype(
+            np.float32
+        )
 
     # -------------------------------------------------
     # 3. MULTI-RESOLUTION DECOMPOSITION
     # -------------------------------------------------
-    def multi_resolution_decomposition(self, image):
+    def multi_resolution_decomposition(
+        self,
+        image
+    ):
         """
-        Perform multi-resolution signal decomposition
-        using a Laplacian pyramid.
-
-        Parameters
-        ----------
-        image : numpy.ndarray
-            Saliency-filtered MRI signal
-
-        Returns
-        -------
-        components : list
-            Multi-resolution signal components
+        Laplacian-pyramid-based
+        multi-resolution decomposition.
         """
 
         components = []
+
         current = image.copy()
 
         for _ in range(self.num_levels):
 
-            # Downsample
-            down = cv2.pyrDown(current)
-
-            # Upsample to the current resolution
-            up = cv2.pyrUp(
-                down,
-                dstsize=(current.shape[1], current.shape[0])
+            down = cv2.pyrDown(
+                current
             )
 
-            # Compute high-frequency residual
-            laplacian = current - up
+            up = cv2.pyrUp(
+                down,
+                dstsize=(
+                    current.shape[1],
+                    current.shape[0]
+                )
+            )
 
-            components.append(laplacian)
+            # High-frequency residual
+            laplacian = (
+                current - up
+            )
 
-            # Continue decomposition at lower resolution
+            components.append(
+                laplacian
+            )
+
             current = down
 
-        # Add lowest-resolution component
-        components.append(current)
+        # Lowest-resolution component
+        components.append(
+            current
+        )
 
         return components
 
     # -------------------------------------------------
     # 4. STATISTICAL FEATURE EXTRACTION
     # -------------------------------------------------
-    def extract_statistical_features(self, components):
+    def extract_statistical_features(
+        self,
+        components
+    ):
         """
-        Extract statistical descriptors from each
-        multi-resolution signal component.
-
-        Descriptors:
+        Extract:
         - Mean
         - Variance
         - Skewness
@@ -181,29 +213,40 @@ class ASGSRPipeline:
 
         for comp in components:
 
-            # Flatten signal component
-            comp_flat = comp.flatten()
+            comp_flat = (
+                comp
+                .astype(np.float32)
+                .flatten()
+            )
 
-            # Mean
-            mean = np.mean(comp_flat)
+            mean = np.mean(
+                comp_flat
+            )
 
-            # Variance
-            var = np.var(comp_flat)
+            variance = np.var(
+                comp_flat
+            )
 
-            # Skewness
-            skew = self._skewness(comp_flat)
+            skewness = (
+                self._skewness(
+                    comp_flat
+                )
+            )
 
-            # Kurtosis
-            kurt = self._kurtosis(comp_flat)
+            kurtosis = (
+                self._kurtosis(
+                    comp_flat
+                )
+            )
 
             features.extend([
                 mean,
-                var,
-                skew,
-                kurt
+                variance,
+                skewness,
+                kurtosis
             ])
 
-        return np.array(
+        return np.asarray(
             features,
             dtype=np.float32
         )
@@ -212,9 +255,6 @@ class ASGSRPipeline:
     # SKEWNESS
     # -------------------------------------------------
     def _skewness(self, x):
-        """
-        Compute standardized third central moment.
-        """
 
         mean = np.mean(x)
         std = np.std(x) + 1e-8
@@ -227,9 +267,6 @@ class ASGSRPipeline:
     # KURTOSIS
     # -------------------------------------------------
     def _kurtosis(self, x):
-        """
-        Compute standardized fourth central moment.
-        """
 
         mean = np.mean(x)
         std = np.std(x) + 1e-8
@@ -239,54 +276,66 @@ class ASGSRPipeline:
         )
 
     # -------------------------------------------------
-    # FULL ASGSR PIPELINE
+    # COMPLETE ASGSR PROCESS
     # -------------------------------------------------
-    def process(self, image, image_tensor):
+    def process(
+        self,
+        image,
+        image_tensor
+    ):
         """
-        Execute the complete ASGSR processing pipeline.
+        Returns:
 
-        Parameters
-        ----------
-        image : numpy.ndarray
-            MRI image of shape (H, W, C)
+        features
+            Statistical ASGSR feature vector.
 
-        image_tensor : torch.Tensor
-            MRI tensor of shape (1, C, H, W)
+        saliency
+            Predicted-class saliency map.
 
-        Returns
-        -------
-        features : numpy.ndarray
-            Extracted statistical feature vector
-
-        saliency : numpy.ndarray
-            Gradient-based saliency map
+        filtered
+            Saliency-guided spatial representation.
         """
 
         # ---------------------------------------------
-        # Step 1: Gradient-based saliency estimation
+        # Step 1: Predicted-class saliency
         # ---------------------------------------------
-        saliency = self.compute_saliency(image_tensor)
+        saliency = (
+            self.compute_saliency(
+                image_tensor
+            )
+        )
 
         # ---------------------------------------------
-        # Step 2: Saliency-guided adaptive filtering
+        # Step 2: Adaptive filtering
         # ---------------------------------------------
-        filtered = self.apply_saliency_filter(
-            image,
-            saliency
+        filtered = (
+            self.apply_saliency_filter(
+                image,
+                saliency
+            )
         )
 
         # ---------------------------------------------
         # Step 3: Multi-resolution decomposition
         # ---------------------------------------------
-        components = self.multi_resolution_decomposition(
+        components = (
+            self.multi_resolution_decomposition(
+                filtered
+            )
+        )
+
+        # ---------------------------------------------
+        # Step 4: Statistical features
+        # ---------------------------------------------
+        features = (
+            self.extract_statistical_features(
+                components
+            )
+        )
+
+        return (
+            features,
+            saliency,
             filtered
         )
-
-        # ---------------------------------------------
-        # Step 4: Statistical feature extraction
-        # ---------------------------------------------
-        features = self.extract_statistical_features(
-            components
-        )
-
-        return features, saliency
+```
