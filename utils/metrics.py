@@ -1,366 +1,286 @@
 import numpy as np
-import torch
-from torch.utils.data import DataLoader
-
-import config
-from data.dataset import MRIDataset
-from models import (
-    SaliencyCNN,
-    ASGSRPipeline,
-    BayesianClassifier
-)
-
-from utils.metrics import (
-    compute_psnr,
-    compute_ssim,
-    compute_snr,
-    compute_edge_preservation
-)
-
-from utils import (
-    plot_confusion_matrix,
-    plot_roc_curve
-)
+import cv2
+from skimage.metrics import peak_signal_noise_ratio
+from skimage.metrics import structural_similarity
 
 
 # -------------------------------------------------
-# LOAD TRAINED SALIENCY CNN
+# HELPER: CONVERT TO GRAYSCALE
 # -------------------------------------------------
-def load_model(device):
-    model = SaliencyCNN(
-        num_classes=config.NUM_CLASSES
+def _to_grayscale(image):
+    """
+    Convert an image to grayscale.
+
+    Supports:
+        (H, W)
+        (H, W, 1)
+        (H, W, 3)
+    """
+
+    image = np.asarray(image, dtype=np.float32)
+
+    if image.ndim == 2:
+        return image
+
+    if image.ndim == 3:
+
+        if image.shape[2] == 1:
+            return image[:, :, 0]
+
+        if image.shape[2] == 3:
+            return cv2.cvtColor(
+                image,
+                cv2.COLOR_RGB2GRAY
+            )
+
+    raise ValueError(
+        f"Unsupported image shape: {image.shape}"
     )
 
-    model.load_state_dict(
-        torch.load(
-            config.MODEL_PATH,
-            map_location=device
+
+# -------------------------------------------------
+# 1. PSNR
+# -------------------------------------------------
+def compute_psnr(reference, representation):
+    """
+    Compute Peak Signal-to-Noise Ratio (PSNR).
+
+    The reference MRI is compared with the
+    derived saliency-guided representation.
+    """
+
+    reference = np.asarray(
+        reference,
+        dtype=np.float32
+    )
+
+    representation = np.asarray(
+        representation,
+        dtype=np.float32
+    )
+
+    # Ensure identical shape
+    if reference.shape != representation.shape:
+        raise ValueError(
+            "Reference and representation must "
+            "have the same shape."
         )
+
+    data_range = (
+        reference.max() - reference.min()
     )
 
-    model = model.to(device)
-    model.eval()
+    if data_range <= 1e-8:
+        data_range = 1.0
 
-    return model
+    return peak_signal_noise_ratio(
+        reference,
+        representation,
+        data_range=data_range
+    )
 
 
 # -------------------------------------------------
-# FEATURE EXTRACTION + SIGNAL METRICS
+# 2. SSIM
 # -------------------------------------------------
-def extract_features(loader, pipeline):
+def compute_ssim(reference, representation):
+    """
+    Compute Structural Similarity Index (SSIM).
 
-    features = []
-    labels = []
+    The metric evaluates structural similarity
+    between the reference MRI and the derived
+    representation.
+    """
 
-    psnr_list = []
-    ssim_list = []
-    snr_list = []
-    edge_list = []
+    reference_gray = _to_grayscale(
+        reference
+    )
 
-    for images, y in loader:
+    representation_gray = _to_grayscale(
+        representation
+    )
 
-        images = images.to(
-            pipeline.device
+    data_range = (
+        reference_gray.max()
+        - reference_gray.min()
+    )
+
+    if data_range <= 1e-8:
+        data_range = 1.0
+
+    return structural_similarity(
+        reference_gray,
+        representation_gray,
+        data_range=data_range
+    )
+
+
+# -------------------------------------------------
+# 3. SNR
+# -------------------------------------------------
+def compute_snr(reference, representation):
+    """
+    Compute Signal-to-Noise Ratio (SNR).
+
+    The residual between the reference MRI and
+    the derived representation is treated as
+    the signal residual for the evaluation.
+    """
+
+    reference = np.asarray(
+        reference,
+        dtype=np.float32
+    )
+
+    representation = np.asarray(
+        representation,
+        dtype=np.float32
+    )
+
+    signal_power = np.mean(
+        reference ** 2
+    )
+
+    residual = (
+        reference - representation
+    )
+
+    noise_power = np.mean(
+        residual ** 2
+    )
+
+    if noise_power <= 1e-12:
+        return float("inf")
+
+    snr = 10.0 * np.log10(
+        (signal_power + 1e-12)
+        / (noise_power + 1e-12)
+    )
+
+    return snr
+
+
+# -------------------------------------------------
+# 4. EDGE PRESERVATION
+# -------------------------------------------------
+def compute_edge_preservation(
+    reference,
+    representation
+):
+    """
+    Compute edge-preservation similarity.
+
+    Canny edge maps are generated for the
+    reference MRI and the derived representation.
+    The Dice similarity between the two edge maps
+    is reported as the edge-preservation score.
+
+    Range:
+        0 -> no edge correspondence
+        1 -> complete edge correspondence
+    """
+
+    reference_gray = _to_grayscale(
+        reference
+    )
+
+    representation_gray = _to_grayscale(
+        representation
+    )
+
+    # ---------------------------------------------
+    # Normalize both images to 8-bit
+    # ---------------------------------------------
+    def normalize_uint8(image):
+
+        image = np.asarray(
+            image,
+            dtype=np.float32
         )
 
-        for i in range(images.shape[0]):
+        min_value = image.min()
+        max_value = image.max()
 
-            # -------------------------------------
-            # ORIGINAL MRI
-            # -------------------------------------
-            img = (
-                images[i]
-                .detach()
-                .cpu()
-                .numpy()
-                .transpose(1, 2, 0)
+        if max_value - min_value <= 1e-8:
+            return np.zeros_like(
+                image,
+                dtype=np.uint8
             )
 
-            # Tensor for saliency computation
-            tensor = images[i].unsqueeze(0)
+        normalized = (
+            (image - min_value)
+            / (max_value - min_value)
+            * 255.0
+        )
 
-            # -------------------------------------
-            # ASGSR PROCESSING
-            # -------------------------------------
-            feat, saliency = pipeline.process(
-                img,
-                tensor
-            )
+        return normalized.astype(
+            np.uint8
+        )
 
-            # -------------------------------------
-            # SALIENCY-GUIDED REPRESENTATION
-            # -------------------------------------
-            filtered = (
-                img
-                * np.expand_dims(
-                    saliency,
-                    axis=-1
-                )
-            )
-
-            # -------------------------------------
-            # SIGNAL-LEVEL METRICS
-            # -------------------------------------
-            psnr_value = compute_psnr(
-                img,
-                filtered
-            )
-
-            ssim_value = compute_ssim(
-                img,
-                filtered
-            )
-
-            snr_value = compute_snr(
-                img,
-                filtered
-            )
-
-            edge_value = compute_edge_preservation(
-                img,
-                filtered
-            )
-
-            # -------------------------------------
-            # STORE METRICS
-            # -------------------------------------
-            psnr_list.append(psnr_value)
-            ssim_list.append(ssim_value)
-            snr_list.append(snr_value)
-            edge_list.append(edge_value)
-
-            # -------------------------------------
-            # STORE FEATURES
-            # -------------------------------------
-            features.append(feat)
-            labels.append(
-                y[i].item()
-            )
-
-    return (
-        np.array(features),
-        np.array(labels),
-        np.mean(psnr_list),
-        np.mean(ssim_list),
-        np.mean(snr_list),
-        np.mean(edge_list)
+    reference_uint8 = normalize_uint8(
+        reference_gray
     )
 
-
-# -------------------------------------------------
-# MAIN EVALUATION
-# -------------------------------------------------
-def evaluate():
-
-    # ---------------------------------------------
-    # DEVICE
-    # ---------------------------------------------
-    device = torch.device(
-        config.DEVICE
-        if torch.cuda.is_available()
-        else "cpu"
-    )
-
-    print(
-        f"Using device: {device}"
+    representation_uint8 = normalize_uint8(
+        representation_gray
     )
 
     # ---------------------------------------------
-    # DATASETS
+    # Canny edge detection
     # ---------------------------------------------
-    train_dataset = MRIDataset(
-        config.DATA_ROOT,
-        split="train",
-        img_size=config.IMG_SIZE
+    reference_edges = cv2.Canny(
+        reference_uint8,
+        threshold1=50,
+        threshold2=150
     )
 
-    test_dataset = MRIDataset(
-        config.DATA_ROOT,
-        split="test",
-        img_size=config.IMG_SIZE
+    representation_edges = cv2.Canny(
+        representation_uint8,
+        threshold1=50,
+        threshold2=150
     )
 
-    # ---------------------------------------------
-    # DATA LOADERS
-    # ---------------------------------------------
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=1,
-        shuffle=False
+    # Convert to Boolean
+    reference_edges = (
+        reference_edges > 0
     )
 
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=1,
-        shuffle=False
+    representation_edges = (
+        representation_edges > 0
     )
 
     # ---------------------------------------------
-    # LOAD TRAINED SALIENCY CNN
+    # Edge overlap
     # ---------------------------------------------
-    print(
-        "\nLoading trained Saliency CNN..."
+    intersection = np.logical_and(
+        reference_edges,
+        representation_edges
+    ).sum()
+
+    reference_count = (
+        reference_edges.sum()
     )
 
-    model = load_model(device)
-
-    # ---------------------------------------------
-    # CREATE ASGSR PIPELINE
-    # ---------------------------------------------
-    pipeline = ASGSRPipeline(
-        model,
-        device=device
-    )
-
-    # ---------------------------------------------
-    # TRAIN FEATURES
-    # ---------------------------------------------
-    print(
-        "\nExtracting TRAIN features..."
-    )
-
-    (
-        X_train,
-        y_train,
-        _,
-        _,
-        _,
-        _
-    ) = extract_features(
-        train_loader,
-        pipeline
-    )
-
-    print(
-        f"Training feature shape: "
-        f"{X_train.shape}"
+    representation_count = (
+        representation_edges.sum()
     )
 
     # ---------------------------------------------
-    # TEST FEATURES
+    # Dice similarity
     # ---------------------------------------------
-    print(
-        "\nExtracting TEST features..."
+    denominator = (
+        reference_count
+        + representation_count
     )
 
-    (
-        X_test,
-        y_test,
-        psnr,
-        ssim,
-        snr,
+    if denominator == 0:
+        return 1.0
+
+    edge_preservation = (
+        2.0 * intersection
+        / denominator
+    )
+
+    return float(
         edge_preservation
-    ) = extract_features(
-        test_loader,
-        pipeline
     )
-
-    print(
-        f"Testing feature shape: "
-        f"{X_test.shape}"
-    )
-
-    # ---------------------------------------------
-    # BAYESIAN CLASSIFIER
-    # ---------------------------------------------
-    print(
-        "\nTraining Bayesian Classifier..."
-    )
-
-    classifier = BayesianClassifier()
-
-    classifier.fit(
-        X_train,
-        y_train
-    )
-
-    # ---------------------------------------------
-    # PREDICTION
-    # ---------------------------------------------
-    y_pred, confidence, probs = (
-        classifier.predict_with_confidence(
-            X_test
-        )
-    )
-
-    # ---------------------------------------------
-    # CLASSIFICATION ACCURACY
-    # ---------------------------------------------
-    accuracy = np.mean(
-        y_pred == y_test
-    )
-
-    # ---------------------------------------------
-    # RESULTS
-    # ---------------------------------------------
-    print(
-        "\n===================================="
-    )
-
-    print(
-        "        ASGSR EVALUATION RESULTS"
-    )
-
-    print(
-        "===================================="
-    )
-
-    print(
-        f"Accuracy           : "
-        f"{accuracy * 100:.2f}%"
-    )
-
-    print(
-        f"PSNR               : "
-        f"{psnr:.2f} dB"
-    )
-
-    print(
-        f"SSIM               : "
-        f"{ssim:.3f}"
-    )
-
-    print(
-        f"SNR                : "
-        f"{snr:.2f} dB"
-    )
-
-    print(
-        f"Edge Preservation  : "
-        f"{edge_preservation:.3f}"
-    )
-
-    print(
-        f"Average Confidence : "
-        f"{np.mean(confidence):.3f}"
-    )
-
-    print(
-        "===================================="
-    )
-
-    # ---------------------------------------------
-    # VISUALIZATION
-    # ---------------------------------------------
-    class_names = (
-        test_dataset.get_class_names()
-    )
-
-    plot_confusion_matrix(
-        y_test,
-        y_pred,
-        class_names
-    )
-
-    plot_roc_curve(
-        y_test,
-        probs,
-        config.NUM_CLASSES
-    )
-
-
-# -------------------------------------------------
-# RUN
-# -------------------------------------------------
-if __name__ == "__main__":
-    evaluate()
