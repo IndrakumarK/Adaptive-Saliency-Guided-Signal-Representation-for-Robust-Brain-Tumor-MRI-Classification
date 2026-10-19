@@ -2,820 +2,877 @@
 ASGSR MRI Classification
 Adaptive Saliency-Guided Signal Representation
 
-Pipeline:
-    1. Predicted-class gradient-based saliency estimation
-    2. Saliency-guided spatial weighting
-    3. Multi-resolution signal decomposition
-    4. Statistical feature extraction
+Saliency CNN
+------------
 
-The CNN is used as a signal-sensitivity/saliency probe.
-The extracted statistical representation can subsequently be
-provided to the Bayesian classifier.
+The CNN serves as the signal-sensitivity / saliency probe
+within the ASGSR framework.
+
+The network produces class logits that are used to obtain
+predicted-class gradient-based saliency maps. The learned
+representation is subsequently processed by the ASGSR
+pipeline and classified using the Bayesian decision stage.
+
+Training objectives implemented here:
+
+    1. Classification loss
+    2. Saliency smoothness regularization
+    3. Mutual-information-inspired feature/class objective
+    4. Confidence regularization
+
+The implementation is intentionally lightweight so that the
+CNN remains a saliency probe rather than replacing the
+statistical + Bayesian classification framework.
 """
 
-import numpy as np
-import cv2
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 
-class ASGSRPipeline:
+# =============================================================
+# BASIC CONVOLUTIONAL BLOCK
+# =============================================================
+
+class ConvBlock(nn.Module):
     """
-    Adaptive Saliency-Guided Signal Representation (ASGSR).
+    Two-layer convolutional feature extraction block.
+    """
 
-    The pipeline converts an MRI image into a compact
-    saliency-guided statistical signal representation.
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
 
-    Processing stages
-    -----------------
-    1. Predicted-class gradient saliency
-    2. Saliency-guided spatial weighting
-    3. Multi-resolution Laplacian decomposition
-    4. Statistical feature extraction
+        self.block = nn.Sequential(
+            nn.Conv2d(
+                in_channels,
+                out_channels,
+                kernel_size=3,
+                padding=1,
+                bias=False
+            ),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(
+                out_channels,
+                out_channels,
+                kernel_size=3,
+                padding=1,
+                bias=False
+            ),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+
+# =============================================================
+# SALIENCY CNN
+# =============================================================
+
+class SaliencyCNN(nn.Module):
+    """
+    CNN used as the signal-sensitivity and saliency probe
+    in the ASGSR framework.
 
     Parameters
     ----------
-    model : torch.nn.Module
-        Trained CNN used as the gradient-based signal
-        sensitivity estimator.
+    num_classes : int
+        Number of MRI classes.
 
-    device : str, optional
-        Computation device, by default "cpu".
+    in_channels : int
+        Number of MRI input channels/modalities.
 
-    num_levels : int, optional
-        Number of Laplacian decomposition levels.
-        Default is 4.
+    channels : tuple
+        Number of channels in successive convolutional blocks.
+
+    dropout : float
+        Dropout probability used before classification.
     """
 
     def __init__(
         self,
-        model,
-        device="cpu",
-        num_levels=4
+        num_classes=4,
+        in_channels=4,
+        channels=(32, 64, 128, 256),
+        dropout=0.20
     ):
-        self.model = model
-        self.device = device
-        self.num_levels = int(num_levels)
+        super().__init__()
 
-        if self.num_levels < 1:
+        if len(channels) != 4:
             raise ValueError(
-                "num_levels must be greater than or equal to 1."
+                "channels must contain four feature dimensions."
             )
 
-        # Move the trained saliency CNN to the selected device.
-        self.model.to(self.device)
+        self.num_classes = int(num_classes)
+        self.in_channels = int(in_channels)
 
-        # Saliency generation is performed in evaluation mode.
-        self.model.eval()
+        c1, c2, c3, c4 = channels
+
+        # -----------------------------------------------------
+        # Feature extraction
+        # -----------------------------------------------------
+
+        self.block1 = ConvBlock(
+            in_channels,
+            c1
+        )
+
+        self.pool1 = nn.MaxPool2d(
+            kernel_size=2,
+            stride=2
+        )
+
+        self.block2 = ConvBlock(
+            c1,
+            c2
+        )
+
+        self.pool2 = nn.MaxPool2d(
+            kernel_size=2,
+            stride=2
+        )
+
+        self.block3 = ConvBlock(
+            c2,
+            c3
+        )
+
+        self.pool3 = nn.MaxPool2d(
+            kernel_size=2,
+            stride=2
+        )
+
+        self.block4 = ConvBlock(
+            c3,
+            c4
+        )
+
+        # -----------------------------------------------------
+        # Global feature representation
+        # -----------------------------------------------------
+
+        self.global_pool = nn.AdaptiveAvgPool2d(
+            (1, 1)
+        )
+
+        self.dropout = nn.Dropout(
+            p=float(dropout)
+        )
+
+        # -----------------------------------------------------
+        # Classification head
+        # -----------------------------------------------------
+
+        self.classifier = nn.Linear(
+            c4,
+            self.num_classes
+        )
+
+        self.feature_dim = c4
+
+        # Store feature maps for optional interpretability
+        # and diagnostic analysis.
+        self._last_feature_map = None
+        self._last_feature_vector = None
 
     # =========================================================
-    # 1. SALIENCY ESTIMATION
+    # FORWARD
     # =========================================================
 
-    def compute_saliency(self, image_tensor):
+    def forward(self, x):
         """
-        Compute a predicted-class gradient-based saliency map.
-
-        The predicted class is obtained directly from the CNN
-        output. Ground-truth labels are therefore not required
-        during saliency generation.
+        Forward propagation.
 
         Parameters
         ----------
-        image_tensor : torch.Tensor
+        x : torch.Tensor
             MRI tensor with shape:
 
-                (1, C, H, W)
+                (B, C, H, W)
 
         Returns
         -------
-        np.ndarray
-            Normalized saliency map with shape (H, W)
-            and values in [0, 1].
+        torch.Tensor
+            Class logits with shape:
+
+                (B, num_classes)
         """
 
-        if not isinstance(image_tensor, torch.Tensor):
+        if not isinstance(x, torch.Tensor):
             raise TypeError(
-                "image_tensor must be a torch.Tensor."
+                "Input must be a torch.Tensor."
             )
 
-        if image_tensor.ndim != 4:
+        if x.ndim != 4:
             raise ValueError(
-                "image_tensor must have shape (1, C, H, W)."
+                "Input must have shape (B, C, H, W)."
             )
 
-        # -----------------------------------------------------
-        # Create an independent tensor for gradient computation
-        # -----------------------------------------------------
-
-        x = (
-            image_tensor
-            .clone()
-            .detach()
-            .to(self.device)
-        )
-
-        x.requires_grad_(True)
-
-        # -----------------------------------------------------
-        # Forward pass through the trained CNN
-        # -----------------------------------------------------
-
-        self.model.zero_grad(set_to_none=True)
-
-        output = self.model(x)
-
-        if output.ndim != 2:
+        if x.shape[1] != self.in_channels:
             raise ValueError(
-                "The saliency CNN must return logits with shape "
-                "(batch_size, num_classes)."
+                f"Expected {self.in_channels} input channels, "
+                f"but received {x.shape[1]}."
             )
 
-        # -----------------------------------------------------
-        # Determine the predicted class
-        # -----------------------------------------------------
+        # Feature extraction
+        x = self.block1(x)
+        x = self.pool1(x)
+
+        x = self.block2(x)
+        x = self.pool2(x)
+
+        x = self.block3(x)
+        x = self.pool3(x)
+
+        x = self.block4(x)
+
+        # Preserve spatial feature map.
+        self._last_feature_map = x
+
+        # Global representation.
+        x = self.global_pool(x)
+        x = torch.flatten(x, 1)
+
+        self._last_feature_vector = x
+
+        x = self.dropout(x)
+
+        logits = self.classifier(x)
+
+        return logits
+
+    # =========================================================
+    # FEATURE EXTRACTION
+    # =========================================================
+
+    def extract_features(self, x):
+        """
+        Extract the compact CNN feature representation.
+
+        This function does not perform Bayesian classification.
+        It returns the feature representation that can be used
+        for analysis or downstream processing.
+        """
+
+        if not isinstance(x, torch.Tensor):
+            raise TypeError(
+                "Input must be a torch.Tensor."
+            )
+
+        # Run the feature extractor explicitly so that the
+        # representation can be obtained independently of the
+        # classification head.
+
+        x = self.block1(x)
+        x = self.pool1(x)
+
+        x = self.block2(x)
+        x = self.pool2(x)
+
+        x = self.block3(x)
+        x = self.pool3(x)
+
+        x = self.block4(x)
+
+        x = self.global_pool(x)
+        x = torch.flatten(x, 1)
+
+        return x
+
+    # =========================================================
+    # PREDICTED-CLASS SCORE
+    # =========================================================
+
+    def predicted_class_score(self, x):
+        """
+        Return the predicted class and corresponding logit.
+
+        The predicted-class response is the quantity used by
+        the ASGSR pipeline for gradient-based saliency.
+        """
+
+        logits = self.forward(x)
 
         predicted_class = torch.argmax(
-            output,
+            logits,
             dim=1
         )
 
-        # -----------------------------------------------------
-        # Select predicted-class response
-        # -----------------------------------------------------
-
-        score = output[
-            0,
-            predicted_class[0]
+        score = logits[
+            torch.arange(
+                logits.shape[0],
+                device=logits.device
+            ),
+            predicted_class
         ]
 
-        # -----------------------------------------------------
-        # Compute gradient with respect to the input MRI
-        # -----------------------------------------------------
+        return (
+            logits,
+            predicted_class,
+            score
+        )
+
+    # =========================================================
+    # PREDICTED-CLASS SALIENCY
+    # =========================================================
+
+    def compute_saliency(
+        self,
+        x,
+        normalize=True
+    ):
+        """
+        Compute predicted-class gradient saliency.
+
+        Saliency is obtained from the absolute gradient of the
+        predicted-class response with respect to the input MRI.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input MRI tensor (B, C, H, W).
+
+        normalize : bool
+            If True, normalize each sample by its maximum
+            saliency value.
+
+        Returns
+        -------
+        saliency : torch.Tensor
+            Saliency map with shape (B, H, W).
+
+        predicted_class : torch.Tensor
+            Predicted class index for each sample.
+        """
+
+        if x.ndim != 4:
+            raise ValueError(
+                "Input must have shape (B, C, H, W)."
+            )
+
+        x_grad = x.clone().detach()
+        x_grad.requires_grad_(True)
+
+        self.zero_grad(set_to_none=True)
+
+        logits = self.forward(
+            x_grad
+        )
+
+        predicted_class = torch.argmax(
+            logits,
+            dim=1
+        )
+
+        batch_indices = torch.arange(
+            logits.shape[0],
+            device=logits.device
+        )
+
+        score = logits[
+            batch_indices,
+            predicted_class
+        ].sum()
 
         score.backward()
 
-        if x.grad is None:
+        if x_grad.grad is None:
             raise RuntimeError(
-                "Input gradient could not be computed. "
-                "Ensure that the CNN output is differentiable "
-                "with respect to the input."
+                "Unable to obtain the input gradient."
             )
 
-        # -----------------------------------------------------
-        # Absolute input gradient = signal sensitivity
-        # -----------------------------------------------------
+        # Absolute gradient.
+        saliency = x_grad.grad.abs()
 
-        saliency = (
-            x.grad
-            .detach()
-            .abs()
-        )
-
-        # -----------------------------------------------------
-        # Aggregate across MRI channels/modalities
-        # -----------------------------------------------------
-
-        saliency, _ = torch.max(
+        # Aggregate across MRI modalities/channels.
+        saliency = torch.max(
             saliency,
             dim=1
-        )
+        ).values
 
-        # -----------------------------------------------------
-        # Convert to NumPy
-        # -----------------------------------------------------
+        if normalize:
 
-        saliency = (
-            saliency
-            .squeeze(0)
-            .detach()
-            .cpu()
-            .numpy()
-            .astype(np.float32)
-        )
-
-        # -----------------------------------------------------
-        # Max normalization
-        #
-        # s_norm = s / max(s)
-        # -----------------------------------------------------
-
-        saliency_max = float(
-            np.max(saliency)
-        )
-
-        if saliency_max > 1e-8:
-
-            saliency = (
-                saliency /
-                saliency_max
+            maximum = (
+                saliency
+                .flatten(1)
+                .amax(dim=1)
+                .view(-1, 1, 1)
             )
 
-        else:
-
-            saliency = np.zeros_like(
-                saliency,
-                dtype=np.float32
+            saliency = torch.where(
+                maximum > 1e-8,
+                saliency / maximum.clamp_min(1e-8),
+                torch.zeros_like(saliency)
             )
 
-        # Numerical safety.
-        saliency = np.clip(
-            saliency,
-            0.0,
-            1.0
-        )
-
-        return saliency.astype(
-            np.float32
+        return (
+            saliency.detach(),
+            predicted_class.detach()
         )
 
     # =========================================================
-    # 2. SALIENCY-GUIDED SPATIAL WEIGHTING
+    # SALIENCY SMOOTHNESS
     # =========================================================
 
-    def apply_saliency_filter(
-        self,
-        image,
+    @staticmethod
+    def saliency_smoothness_loss(
         saliency
     ):
         """
-        Apply the saliency map as a spatial weighting function.
+        Spatial smoothness regularization for the saliency map.
 
-        Each spatial location of the MRI signal is weighted
-        according to its predicted-class sensitivity.
+        The loss penalizes abrupt horizontal and vertical
+        variations while preserving the main sensitivity
+        structure.
 
         Parameters
         ----------
-        image : np.ndarray
-            MRI image with shape (H, W) or (H, W, C).
-
-        saliency : np.ndarray
-            Saliency map with shape (H, W).
+        saliency : torch.Tensor
+            Saliency map with shape (B, H, W).
 
         Returns
         -------
-        np.ndarray
-            Saliency-weighted MRI signal.
+        torch.Tensor
+            Smoothness loss.
         """
 
-        if not isinstance(
-            image,
-            np.ndarray
-        ):
-            image = np.asarray(
-                image,
-                dtype=np.float32
-            )
-
-        if not isinstance(
-            saliency,
-            np.ndarray
-        ):
-            saliency = np.asarray(
-                saliency,
-                dtype=np.float32
-            )
-
-        if saliency.ndim != 2:
+        if saliency.ndim != 3:
             raise ValueError(
-                "Saliency map must have shape (H, W)."
+                "Saliency must have shape (B, H, W)."
             )
-
-        if image.ndim not in (2, 3):
-            raise ValueError(
-                "Image must have shape (H, W) or (H, W, C)."
-            )
-
-        # -----------------------------------------------------
-        # Check spatial compatibility
-        # -----------------------------------------------------
 
         if (
-            image.shape[0] != saliency.shape[0]
-            or
-            image.shape[1] != saliency.shape[1]
+            saliency.shape[-1] < 2
+            or saliency.shape[-2] < 2
         ):
-            raise ValueError(
-                "Image and saliency map must have identical "
-                "spatial dimensions."
-            )
+            return saliency.new_tensor(0.0)
 
-        # -----------------------------------------------------
-        # Ensure saliency is in [0, 1]
-        # -----------------------------------------------------
-
-        saliency = np.clip(
-            saliency,
-            0.0,
-            1.0
-        ).astype(
-            np.float32
+        horizontal = (
+            saliency[:, :, 1:]
+            -
+            saliency[:, :, :-1]
         )
 
-        # -----------------------------------------------------
-        # Expand saliency map for multi-channel MRI
-        # -----------------------------------------------------
-
-        if image.ndim == 3:
-
-            saliency_weight = np.expand_dims(
-                saliency,
-                axis=-1
-            )
-
-        else:
-
-            saliency_weight = saliency
-
-        # -----------------------------------------------------
-        # Element-wise spatial weighting
-        # -----------------------------------------------------
-
-        filtered = (
-            image.astype(np.float32)
-            *
-            saliency_weight
+        vertical = (
+            saliency[:, 1:, :]
+            -
+            saliency[:, :-1, :]
         )
 
-        return filtered.astype(
-            np.float32
+        loss = (
+            horizontal.abs().mean()
+            +
+            vertical.abs().mean()
         )
+
+        return loss
 
     # =========================================================
-    # 3. MULTI-RESOLUTION SIGNAL DECOMPOSITION
+    # MUTUAL-INFORMATION-INSPIRED OBJECTIVE
     # =========================================================
 
-    def multi_resolution_decomposition(
+    def mutual_information_loss(
         self,
-        image
+        features,
+        labels
     ):
         """
-        Perform multi-resolution signal decomposition
-        using a Laplacian pyramid.
+        Mutual-information-inspired discriminative objective.
 
-        Each level contains a high-frequency residual,
-        followed by a final low-resolution component.
+        The objective encourages the learned representation to
+        retain class-discriminative information.
+
+        A normalized class-centroid separation formulation is
+        used here. Within-class compactness is minimized while
+        between-class separation is maximized.
+
+        This provides a differentiable representation-level
+        objective without introducing an additional neural
+        estimator.
 
         Parameters
         ----------
-        image : np.ndarray
-            Saliency-weighted MRI signal.
+        features : torch.Tensor
+            Feature representation (B, D).
+
+        labels : torch.Tensor
+            Ground-truth class labels (B,).
 
         Returns
         -------
-        list of np.ndarray
-            Multi-resolution signal components.
+        torch.Tensor
+            Representation discrimination loss.
         """
 
-        if not isinstance(
-            image,
-            np.ndarray
-        ):
-            image = np.asarray(
-                image,
-                dtype=np.float32
-            )
-
-        if image.ndim not in (2, 3):
+        if features.ndim != 2:
             raise ValueError(
-                "Input image must have shape "
-                "(H, W) or (H, W, C)."
+                "features must have shape (B, D)."
             )
 
-        components = []
+        if labels.ndim != 1:
+            labels = labels.view(-1)
 
-        # -----------------------------------------------------
-        # Initial signal
-        # -----------------------------------------------------
+        if features.shape[0] != labels.shape[0]:
+            raise ValueError(
+                "features and labels must contain the same "
+                "number of samples."
+            )
 
-        current = image.astype(
-            np.float32,
-            copy=True
+        unique_classes = torch.unique(
+            labels
         )
 
-        # -----------------------------------------------------
-        # Construct Laplacian pyramid
-        # -----------------------------------------------------
+        if unique_classes.numel() < 2:
+            return features.new_tensor(0.0)
 
-        for level in range(
-            self.num_levels
-        ):
-
-            # Safety check for very small images.
-            if (
-                current.shape[0] < 4
-                or
-                current.shape[1] < 4
-            ):
-                break
-
-            # -------------------------------------------------
-            # Downsample
-            # -------------------------------------------------
-
-            down = cv2.pyrDown(
-                current
-            )
-
-            # -------------------------------------------------
-            # Upsample to current resolution
-            # -------------------------------------------------
-
-            up = cv2.pyrUp(
-                down,
-                dstsize=(
-                    current.shape[1],
-                    current.shape[0]
-                )
-            )
-
-            # -------------------------------------------------
-            # High-frequency residual
-            # -------------------------------------------------
-
-            laplacian = (
-                current - up
-            )
-
-            components.append(
-                laplacian.astype(
-                    np.float32
-                )
-            )
-
-            # -------------------------------------------------
-            # Continue at lower resolution
-            # -------------------------------------------------
-
-            current = down.astype(
-                np.float32
-            )
-
-        # -----------------------------------------------------
-        # Final low-resolution component
-        # -----------------------------------------------------
-
-        components.append(
-            current.astype(
-                np.float32
-            )
+        # Normalize the representation.
+        normalized = F.normalize(
+            features,
+            p=2,
+            dim=1
         )
 
-        return components
+        centroids = []
+        within_class = features.new_tensor(0.0)
 
-    # =========================================================
-    # 4. STATISTICAL FEATURE EXTRACTION
-    # =========================================================
+        valid_classes = []
 
-    def extract_statistical_features(
-        self,
-        components
-    ):
-        """
-        Extract statistical descriptors from each
-        multi-resolution component.
+        for cls in unique_classes:
 
-        Descriptors
-        -----------
-        1. Mean
-        2. Variance
-        3. Skewness
-        4. Kurtosis
+            mask = labels == cls
 
-        For L decomposition levels, the resulting feature
-        vector contains:
+            if mask.sum() == 0:
+                continue
 
-            4 × (L + 1)
-
-        features.
-
-        Parameters
-        ----------
-        components : list of np.ndarray
-            Multi-resolution signal components.
-
-        Returns
-        -------
-        np.ndarray
-            Statistical feature vector.
-        """
-
-        if not isinstance(
-            components,
-            (list, tuple)
-        ):
-            raise TypeError(
-                "components must be a list or tuple "
-                "of NumPy arrays."
-            )
-
-        if len(components) == 0:
-            raise ValueError(
-                "No multi-resolution components were provided."
-            )
-
-        features = []
-
-        for component in components:
-
-            if component is None:
-                raise ValueError(
-                    "A decomposition component is None."
-                )
-
-            comp = np.asarray(
-                component,
-                dtype=np.float64
-            )
-
-            # -------------------------------------------------
-            # Flatten component
-            # -------------------------------------------------
-
-            values = comp.reshape(
-                -1
-            )
-
-            # -------------------------------------------------
-            # Remove non-finite values
-            # -------------------------------------------------
-
-            values = values[
-                np.isfinite(values)
+            class_features = normalized[
+                mask
             ]
 
-            if values.size == 0:
+            centroid = F.normalize(
+                class_features.mean(dim=0, keepdim=True),
+                p=2,
+                dim=1
+            ).squeeze(0)
 
-                mean = 0.0
-                variance = 0.0
-                skewness = 0.0
-                kurtosis = 0.0
+            centroids.append(
+                centroid
+            )
 
-            else:
+            valid_classes.append(cls)
 
-                # ---------------------------------------------
-                # Mean
-                # ---------------------------------------------
-
-                mean = float(
-                    np.mean(values)
+            # Within-class dispersion.
+            distances = (
+                1.0
+                -
+                torch.sum(
+                    class_features * centroid.unsqueeze(0),
+                    dim=1
                 )
+            )
 
-                # ---------------------------------------------
-                # Variance
-                # ---------------------------------------------
+            within_class = (
+                within_class
+                +
+                distances.mean()
+            )
 
-                variance = float(
-                    np.var(values)
-                )
+        if len(centroids) < 2:
+            return features.new_tensor(0.0)
 
-                # ---------------------------------------------
-                # Skewness
-                # ---------------------------------------------
-
-                skewness = float(
-                    self._skewness(values)
-                )
-
-                # ---------------------------------------------
-                # Kurtosis
-                # ---------------------------------------------
-
-                kurtosis = float(
-                    self._kurtosis(values)
-                )
-
-            features.extend([
-                mean,
-                variance,
-                skewness,
-                kurtosis
-            ])
-
-        return np.asarray(
-            features,
-            dtype=np.float32
+        centroids = torch.stack(
+            centroids,
+            dim=0
         )
 
+        within_class = (
+            within_class
+            /
+            len(centroids)
+        )
+
+        # Pairwise centroid similarity.
+        similarity = torch.mm(
+            centroids,
+            centroids.t()
+        )
+
+        mask = ~torch.eye(
+            similarity.shape[0],
+            dtype=torch.bool,
+            device=similarity.device
+        )
+
+        between_similarity = (
+            similarity[mask].mean()
+        )
+
+        # Lower within-class dispersion and lower
+        # between-class similarity are desirable.
+        loss = (
+            within_class
+            +
+            between_similarity
+        )
+
+        return loss
+
     # =========================================================
-    # 5. SKEWNESS
+    # CONFIDENCE REGULARIZATION
     # =========================================================
 
     @staticmethod
-    def _skewness(x):
-        """
-        Compute the standardized third central moment.
-
-        Skewness:
-            E[((x - μ) / σ)^3]
-        """
-
-        x = np.asarray(
-            x,
-            dtype=np.float64
-        )
-
-        if x.size == 0:
-            return 0.0
-
-        mean = np.mean(x)
-
-        std = np.std(x)
-
-        if std < 1e-12:
-            return 0.0
-
-        value = np.mean(
-            ((x - mean) / std) ** 3
-        )
-
-        if not np.isfinite(value):
-            return 0.0
-
-        return float(value)
-
-    # =========================================================
-    # 6. KURTOSIS
-    # =========================================================
-
-    @staticmethod
-    def _kurtosis(x):
-        """
-        Compute the standardized fourth central moment.
-
-        Note:
-            This is the fourth standardized moment itself,
-            not excess kurtosis.
-
-        Kurtosis:
-            E[((x - μ) / σ)^4]
-        """
-
-        x = np.asarray(
-            x,
-            dtype=np.float64
-        )
-
-        if x.size == 0:
-            return 0.0
-
-        mean = np.mean(x)
-
-        std = np.std(x)
-
-        if std < 1e-12:
-            return 0.0
-
-        value = np.mean(
-            ((x - mean) / std) ** 4
-        )
-
-        if not np.isfinite(value):
-            return 0.0
-
-        return float(value)
-
-    # =========================================================
-    # 7. COMPLETE ASGSR PIPELINE
-    # =========================================================
-
-    def process(
-        self,
-        image,
-        image_tensor
+    def confidence_regularization(
+        logits,
+        labels
     ):
         """
-        Execute the complete ASGSR processing pipeline.
+        Confidence regularization.
 
-        Pipeline:
-            MRI
-              ↓
-            Predicted-class saliency
-              ↓
-            Saliency-guided spatial weighting
-              ↓
-            Multi-resolution decomposition
-              ↓
-            Statistical descriptors
-              ↓
-            Feature vector
+        The objective discourages excessive confidence when the
+        predicted class is incorrect while retaining confidence
+        for correctly classified samples.
+
+        This is implemented using the difference between
+        predicted confidence and correctness.
 
         Parameters
         ----------
-        image : np.ndarray
-            MRI image with shape (H, W) or (H, W, C).
+        logits : torch.Tensor
+            Class logits (B, K).
 
-        image_tensor : torch.Tensor
-            Corresponding CNN input tensor with shape
-            (1, C, H, W).
+        labels : torch.Tensor
+            Ground-truth labels (B,).
 
         Returns
         -------
-        features : np.ndarray
-            Statistical ASGSR feature vector.
-
-        saliency : np.ndarray
-            Predicted-class gradient saliency map.
+        torch.Tensor
+            Confidence regularization loss.
         """
 
-        # -----------------------------------------------------
-        # Step 1
-        # Predicted-class gradient saliency
-        # -----------------------------------------------------
-
-        saliency = self.compute_saliency(
-            image_tensor
-        )
-
-        # -----------------------------------------------------
-        # Step 2
-        # Saliency-guided spatial weighting
-        # -----------------------------------------------------
-
-        filtered = self.apply_saliency_filter(
-            image,
-            saliency
-        )
-
-        # -----------------------------------------------------
-        # Step 3
-        # Multi-resolution decomposition
-        # -----------------------------------------------------
-
-        components = (
-            self.multi_resolution_decomposition(
-                filtered
+        if logits.ndim != 2:
+            raise ValueError(
+                "logits must have shape (B, K)."
             )
+
+        probabilities = F.softmax(
+            logits,
+            dim=1
         )
 
-        # -----------------------------------------------------
-        # Step 4
-        # Statistical feature extraction
-        # -----------------------------------------------------
-
-        features = (
-            self.extract_statistical_features(
-                components
-            )
+        confidence, prediction = (
+            probabilities.max(dim=1)
         )
 
-        return features, saliency
+        correct = (
+            prediction == labels
+        ).float()
+
+        # Correct predictions should support confidence,
+        # whereas incorrect predictions should not become
+        # excessively confident.
+        loss = (
+            correct * (1.0 - confidence)
+            +
+            (1.0 - correct) * confidence
+        )
+
+        return loss.mean()
 
     # =========================================================
-    # 8. OPTIONAL COMPONENT-LEVEL PROCESSING
+    # COMPLETE TRAINING OBJECTIVE
     # =========================================================
 
-    def process_with_components(
+    def compute_training_loss(
         self,
-        image,
-        image_tensor
+        images,
+        labels,
+        beta=0.10,
+        lambda2=0.10
     ):
         """
-        Execute ASGSR while additionally returning the
-        intermediate decomposition components.
+        Compute the complete ASGSR CNN training objective.
 
-        Useful for debugging, visualization, and
-        reproducibility analysis.
+        Objective structure:
+
+            L_total =
+                L_cls
+                + beta * L_saliency
+                + L_MI
+                + lambda2 * L_conf
+
+        where:
+
+            L_cls
+                = classification loss
+
+            L_saliency
+                = spatial saliency smoothness
+
+            L_MI
+                = representation-level
+                  discriminative objective
+
+            L_conf
+                = confidence regularization
+
+        Parameters
+        ----------
+        images : torch.Tensor
+            MRI batch.
+
+        labels : torch.Tensor
+            Ground-truth labels.
+
+        beta : float
+            Saliency smoothness weight.
+            Default = 0.10.
+
+        lambda2 : float
+            Confidence regularization weight.
+            Default = 0.10.
 
         Returns
         -------
         dict
-            Dictionary containing:
-                features
-                saliency
-                filtered_image
-                components
+            Complete loss dictionary.
         """
 
+        if beta < 0:
+            raise ValueError(
+                "beta must be non-negative."
+            )
+
+        if lambda2 < 0:
+            raise ValueError(
+                "lambda2 must be non-negative."
+            )
+
+        # -----------------------------------------------------
+        # Forward pass
+        # -----------------------------------------------------
+
+        logits = self.forward(
+            images
+        )
+
+        # -----------------------------------------------------
+        # Classification objective
+        # -----------------------------------------------------
+
+        classification_loss = F.cross_entropy(
+            logits,
+            labels
+        )
+
+        # -----------------------------------------------------
+        # Representation
+        # -----------------------------------------------------
+
+        features = self._last_feature_vector
+
+        if features is None:
+            raise RuntimeError(
+                "Feature representation was not generated."
+            )
+
+        # -----------------------------------------------------
         # Saliency
-        saliency = self.compute_saliency(
-            image_tensor
+        #
+        # Use a differentiable predicted-class response for
+        # the saliency regularization term.
+        # -----------------------------------------------------
+
+        predicted_class = torch.argmax(
+            logits.detach(),
+            dim=1
         )
 
-        # Spatial weighting
-        filtered = self.apply_saliency_filter(
-            image,
+        batch_indices = torch.arange(
+            logits.shape[0],
+            device=logits.device
+        )
+
+        predicted_scores = logits[
+            batch_indices,
+            predicted_class
+        ]
+
+        saliency_grad = torch.autograd.grad(
+            predicted_scores.sum(),
+            images,
+            create_graph=True,
+            retain_graph=True,
+            allow_unused=False
+        )[0]
+
+        saliency = saliency_grad.abs().max(
+            dim=1
+        ).values
+
+        maximum = (
             saliency
+            .flatten(1)
+            .amax(dim=1)
+            .view(-1, 1, 1)
         )
 
-        # Multi-resolution decomposition
-        components = (
-            self.multi_resolution_decomposition(
-                filtered
+        saliency = torch.where(
+            maximum > 1e-8,
+            saliency / maximum.clamp_min(1e-8),
+            torch.zeros_like(saliency)
+        )
+
+        saliency_loss = (
+            self.saliency_smoothness_loss(
+                saliency
             )
         )
 
-        # Statistical representation
-        features = (
-            self.extract_statistical_features(
-                components
+        # -----------------------------------------------------
+        # Mutual-information-inspired representation objective
+        # -----------------------------------------------------
+
+        mi_loss = (
+            self.mutual_information_loss(
+                features,
+                labels
             )
+        )
+
+        # -----------------------------------------------------
+        # Confidence regularization
+        # -----------------------------------------------------
+
+        confidence_loss = (
+            self.confidence_regularization(
+                logits,
+                labels
+            )
+        )
+
+        # -----------------------------------------------------
+        # Total objective
+        # -----------------------------------------------------
+
+        total_loss = (
+            classification_loss
+            +
+            beta * saliency_loss
+            +
+            mi_loss
+            +
+            lambda2 * confidence_loss
         )
 
         return {
-            "features": features,
-            "saliency": saliency,
-            "filtered_image": filtered,
-            "components": components
+            "total": total_loss,
+            "classification": classification_loss,
+            "saliency": saliency_loss,
+            "mutual_information": mi_loss,
+            "confidence": confidence_loss
         }
 
 
@@ -825,93 +882,97 @@ class ASGSRPipeline:
 
 if __name__ == "__main__":
 
-    class DummyCNN(torch.nn.Module):
-
-        def __init__(self):
-            super().__init__()
-
-            self.features = torch.nn.Sequential(
-                torch.nn.Conv2d(
-                    4,
-                    32,
-                    kernel_size=3,
-                    padding=1
-                ),
-                torch.nn.ReLU(),
-
-                torch.nn.Conv2d(
-                    32,
-                    64,
-                    kernel_size=3,
-                    padding=1
-                ),
-                torch.nn.ReLU(),
-
-                torch.nn.AdaptiveAvgPool2d(
-                    (1, 1)
-                )
-            )
-
-            self.classifier = torch.nn.Linear(
-                64,
-                4
-            )
-
-        def forward(self, x):
-
-            x = self.features(x)
-
-            x = x.flatten(
-                1
-            )
-
-            return self.classifier(x)
-
-    # ---------------------------------------------------------
-    # Test configuration
-    # ---------------------------------------------------------
-
     device = (
         "cuda"
         if torch.cuda.is_available()
         else "cpu"
     )
 
-    model = DummyCNN()
+    model = SaliencyCNN(
+        num_classes=4,
+        in_channels=4
+    ).to(device)
 
-    pipeline = ASGSRPipeline(
-        model=model,
-        device=device,
-        num_levels=4
-    )
-
-    # Four-channel MRI example.
-    image_tensor = torch.randn(
-        1,
+    images = torch.randn(
+        4,
         4,
         224,
-        224
+        224,
+        device=device
     )
 
-    image = (
-        image_tensor[0]
-        .permute(1, 2, 0)
-        .numpy()
-        .astype(np.float32)
+    labels = torch.tensor(
+        [0, 1, 2, 3],
+        device=device
     )
 
     # ---------------------------------------------------------
-    # Execute pipeline
+    # Forward test
     # ---------------------------------------------------------
 
-    features, saliency = pipeline.process(
-        image,
-        image_tensor
+    logits = model(
+        images
+    )
+
+    print(
+        "Logits shape:",
+        tuple(logits.shape)
+    )
+
+    # ---------------------------------------------------------
+    # Loss test
+    # ---------------------------------------------------------
+
+    losses = model.compute_training_loss(
+        images,
+        labels,
+        beta=0.10,
+        lambda2=0.10
+    )
+
+    print(
+        "Total loss:",
+        float(losses["total"].detach())
+    )
+
+    print(
+        "Classification loss:",
+        float(losses["classification"].detach())
+    )
+
+    print(
+        "Saliency loss:",
+        float(losses["saliency"].detach())
+    )
+
+    print(
+        "Mutual-information loss:",
+        float(losses["mutual_information"].detach())
+    )
+
+    print(
+        "Confidence loss:",
+        float(losses["confidence"].detach())
+    )
+
+    # ---------------------------------------------------------
+    # Saliency test
+    # ---------------------------------------------------------
+
+    saliency, predicted_class = (
+        model.compute_saliency(
+            images[:1]
+        )
     )
 
     print(
         "Saliency shape:",
-        saliency.shape
+        tuple(saliency.shape)
+    )
+
+    print(
+        "Predicted class:",
+        predicted_class.tolist()
     )
 
     print(
@@ -919,14 +980,4 @@ if __name__ == "__main__":
         float(saliency.min()),
         "to",
         float(saliency.max())
-    )
-
-    print(
-        "Feature vector shape:",
-        features.shape
-    )
-
-    print(
-        "Number of extracted features:",
-        len(features)
     )
