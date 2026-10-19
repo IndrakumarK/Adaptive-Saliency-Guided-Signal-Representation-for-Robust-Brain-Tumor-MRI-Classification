@@ -1,3 +1,19 @@
+"""
+ASGSR MRI Classification Pipeline
+
+Adaptive Saliency-Guided Signal Representation (ASGSR)
+
+Pipeline:
+    1. Predicted-class saliency estimation
+    2. Adaptive saliency-guided spatial weighting
+    3. Multi-resolution signal decomposition
+    4. Statistical feature extraction
+
+The saliency map is computed with respect to the class
+predicted by the trained saliency-estimation CNN.
+Ground-truth labels are not required during inference.
+"""
+
 import numpy as np
 import cv2
 import torch
@@ -5,17 +21,14 @@ import torch
 
 class ASGSRPipeline:
     """
-    Adaptive Saliency-Guided Signal Representation (ASGSR)
+    Adaptive Saliency-Guided Signal Representation (ASGSR).
 
-    Pipeline:
-    1. Predicted-class saliency estimation
-    2. Adaptive saliency-guided spatial filtering
-    3. Multi-resolution signal decomposition
-    4. Statistical feature extraction
-
-    During inference, the ground-truth class is not required.
-    The saliency map is computed with respect to the class
-    predicted by the trained saliency-estimation CNN.
+    The pipeline first estimates task-conditioned spatial
+    sensitivity using the gradient of the predicted-class
+    score with respect to the input MRI. The normalized
+    saliency map is then used for spatial weighting, followed
+    by multi-resolution decomposition and statistical feature
+    extraction.
     """
 
     def __init__(self, model, device="cpu", num_levels=4):
@@ -43,6 +56,7 @@ class ASGSRPipeline:
     # =================================================
     # 1. PREDICTED-CLASS SALIENCY ESTIMATION
     # =================================================
+
     def compute_saliency(self, image_tensor):
         """
         Compute gradient-based saliency with respect to
@@ -58,13 +72,14 @@ class ASGSRPipeline:
         Returns
         -------
         saliency : numpy.ndarray
-            Normalized saliency map in the range [0, 1].
+            Max-normalized saliency map in the range [0, 1].
         """
 
         # ---------------------------------------------
-        # Create independent tensor for gradient
+        # Create an independent tensor for gradient
         # computation
         # ---------------------------------------------
+
         image_tensor = (
             image_tensor
             .clone()
@@ -77,11 +92,13 @@ class ASGSRPipeline:
         # ---------------------------------------------
         # Forward pass through trained CNN
         # ---------------------------------------------
+
         output = self.model(image_tensor)
 
         # ---------------------------------------------
         # Determine predicted class
         # ---------------------------------------------
+
         predicted_class = torch.argmax(
             output,
             dim=1
@@ -90,6 +107,7 @@ class ASGSRPipeline:
         # ---------------------------------------------
         # Select predicted-class score
         # ---------------------------------------------
+
         score = output[
             0,
             predicted_class[0]
@@ -98,17 +116,20 @@ class ASGSRPipeline:
         # ---------------------------------------------
         # Clear previously accumulated gradients
         # ---------------------------------------------
+
         self.model.zero_grad()
 
         # ---------------------------------------------
         # Compute gradient of predicted-class score
         # with respect to the input MRI
         # ---------------------------------------------
+
         score.backward()
 
         # ---------------------------------------------
-        # Absolute gradient represents sensitivity
+        # Absolute gradient represents input sensitivity
         # ---------------------------------------------
+
         saliency = (
             image_tensor.grad
             .detach()
@@ -118,6 +139,7 @@ class ASGSRPipeline:
         # ---------------------------------------------
         # Aggregate gradients across channels
         # ---------------------------------------------
+
         saliency, _ = torch.max(
             saliency,
             dim=1
@@ -126,6 +148,7 @@ class ASGSRPipeline:
         # ---------------------------------------------
         # Convert to NumPy
         # ---------------------------------------------
+
         saliency = (
             saliency
             .squeeze()
@@ -134,17 +157,19 @@ class ASGSRPipeline:
         )
 
         # ---------------------------------------------
-        # Normalize saliency to [0, 1]
+        # Maximum normalization
+        #
+        # S_norm = S / max(S)
+        #
+        # This differs from min-max normalization.
         # ---------------------------------------------
-        saliency_min = saliency.min()
+
         saliency_max = saliency.max()
 
-        if saliency_max > saliency_min:
+        if saliency_max > 1e-8:
 
             saliency = (
-                saliency - saliency_min
-            ) / (
-                saliency_max - saliency_min
+                saliency / saliency_max
             )
 
         else:
@@ -159,20 +184,17 @@ class ASGSRPipeline:
         )
 
     # =================================================
-    # 2. ADAPTIVE SALIENCY-GUIDED FILTERING
+    # 2. ADAPTIVE SALIENCY-GUIDED SPATIAL WEIGHTING
     # =================================================
+
     def apply_saliency_filter(
         self,
         image,
         saliency
     ):
         """
-        Apply normalized saliency as a spatial
+        Apply the normalized saliency map as a spatial
         weighting function.
-
-        Since the saliency map is normalized to [0, 1],
-        the resulting spatial weighting does not
-        amplify the magnitude of the input signal.
 
         Parameters
         ----------
@@ -180,7 +202,7 @@ class ASGSRPipeline:
             Input MRI image of shape (H, W, C).
 
         saliency : numpy.ndarray
-            Saliency map of shape (H, W).
+            Normalized saliency map of shape (H, W).
 
         Returns
         -------
@@ -191,6 +213,7 @@ class ASGSRPipeline:
         # ---------------------------------------------
         # Convert input to float32
         # ---------------------------------------------
+
         image = np.asarray(
             image,
             dtype=np.float32
@@ -202,8 +225,20 @@ class ASGSRPipeline:
         )
 
         # ---------------------------------------------
+        # Ensure saliency is normalized
+        # ---------------------------------------------
+
+        saliency_max = saliency.max()
+
+        if saliency_max > 1e-8:
+            saliency = (
+                saliency / saliency_max
+            )
+
+        # ---------------------------------------------
         # Expand saliency map for multi-channel image
         # ---------------------------------------------
+
         if image.ndim == 3:
 
             saliency = np.expand_dims(
@@ -214,6 +249,7 @@ class ASGSRPipeline:
         # ---------------------------------------------
         # Element-wise spatial weighting
         # ---------------------------------------------
+
         filtered = (
             image * saliency
         )
@@ -225,13 +261,14 @@ class ASGSRPipeline:
     # =================================================
     # 3. MULTI-RESOLUTION DECOMPOSITION
     # =================================================
+
     def multi_resolution_decomposition(
         self,
         image
     ):
         """
-        Perform multi-resolution signal decomposition
-        using a Laplacian pyramid.
+        Perform hierarchical multi-resolution
+        decomposition using the current implementation.
 
         The proposed implementation uses K = 4
         decomposition levels.
@@ -239,7 +276,7 @@ class ASGSRPipeline:
         Parameters
         ----------
         image : numpy.ndarray
-            Saliency-filtered MRI representation.
+            Saliency-weighted MRI representation.
 
         Returns
         -------
@@ -252,11 +289,13 @@ class ASGSRPipeline:
         # ---------------------------------------------
         # Initial signal
         # ---------------------------------------------
+
         current = image.copy()
 
         # ---------------------------------------------
         # Hierarchical decomposition
         # ---------------------------------------------
+
         for level in range(
             self.num_levels
         ):
@@ -264,6 +303,7 @@ class ASGSRPipeline:
             # -----------------------------------------
             # Downsample
             # -----------------------------------------
+
             down = cv2.pyrDown(
                 current
             )
@@ -271,6 +311,7 @@ class ASGSRPipeline:
             # -----------------------------------------
             # Upsample to current resolution
             # -----------------------------------------
+
             up = cv2.pyrUp(
                 down,
                 dstsize=(
@@ -282,6 +323,7 @@ class ASGSRPipeline:
             # -----------------------------------------
             # High-frequency residual
             # -----------------------------------------
+
             laplacian = (
                 current - up
             )
@@ -293,11 +335,13 @@ class ASGSRPipeline:
             # -----------------------------------------
             # Continue at lower resolution
             # -----------------------------------------
+
             current = down
 
         # ---------------------------------------------
         # Lowest-resolution component
         # ---------------------------------------------
+
         components.append(
             current
         )
@@ -307,6 +351,7 @@ class ASGSRPipeline:
     # =================================================
     # 4. STATISTICAL FEATURE EXTRACTION
     # =================================================
+
     def extract_statistical_features(
         self,
         components
@@ -316,10 +361,10 @@ class ASGSRPipeline:
         multi-resolution component.
 
         Descriptors:
-        - Mean
-        - Variance
-        - Skewness
-        - Kurtosis
+            - Mean
+            - Variance
+            - Skewness
+            - Kurtosis
 
         Parameters
         ----------
@@ -339,6 +384,7 @@ class ASGSRPipeline:
             # -----------------------------------------
             # Flatten component
             # -----------------------------------------
+
             comp_flat = (
                 comp
                 .astype(np.float32)
@@ -348,6 +394,7 @@ class ASGSRPipeline:
             # -----------------------------------------
             # Mean
             # -----------------------------------------
+
             mean = np.mean(
                 comp_flat
             )
@@ -355,6 +402,7 @@ class ASGSRPipeline:
             # -----------------------------------------
             # Variance
             # -----------------------------------------
+
             variance = np.var(
                 comp_flat
             )
@@ -362,6 +410,7 @@ class ASGSRPipeline:
             # -----------------------------------------
             # Skewness
             # -----------------------------------------
+
             skewness = (
                 self._skewness(
                     comp_flat
@@ -371,6 +420,7 @@ class ASGSRPipeline:
             # -----------------------------------------
             # Kurtosis
             # -----------------------------------------
+
             kurtosis = (
                 self._kurtosis(
                     comp_flat
@@ -380,6 +430,7 @@ class ASGSRPipeline:
             # -----------------------------------------
             # Store descriptors
             # -----------------------------------------
+
             features.extend([
                 mean,
                 variance,
@@ -395,6 +446,7 @@ class ASGSRPipeline:
     # =================================================
     # SKEWNESS
     # =================================================
+
     def _skewness(self, x):
         """
         Compute standardized third central moment.
@@ -414,6 +466,7 @@ class ASGSRPipeline:
     # =================================================
     # KURTOSIS
     # =================================================
+
     def _kurtosis(self, x):
         """
         Compute standardized fourth central moment.
@@ -433,6 +486,7 @@ class ASGSRPipeline:
     # =================================================
     # COMPLETE ASGSR PROCESS
     # =================================================
+
     def process(
         self,
         image,
@@ -464,6 +518,7 @@ class ASGSRPipeline:
         # ---------------------------------------------
         # Step 1: Predicted-class saliency
         # ---------------------------------------------
+
         saliency = (
             self.compute_saliency(
                 image_tensor
@@ -471,8 +526,9 @@ class ASGSRPipeline:
         )
 
         # ---------------------------------------------
-        # Step 2: Adaptive saliency-guided filtering
+        # Step 2: Saliency-guided spatial weighting
         # ---------------------------------------------
+
         filtered = (
             self.apply_saliency_filter(
                 image,
@@ -483,6 +539,7 @@ class ASGSRPipeline:
         # ---------------------------------------------
         # Step 3: Multi-resolution decomposition
         # ---------------------------------------------
+
         components = (
             self.multi_resolution_decomposition(
                 filtered
@@ -492,6 +549,7 @@ class ASGSRPipeline:
         # ---------------------------------------------
         # Step 4: Statistical feature extraction
         # ---------------------------------------------
+
         features = (
             self.extract_statistical_features(
                 components
