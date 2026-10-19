@@ -1,4 +1,3 @@
-```python
 """
 Configuration file for ASGSR MRI Classification
 """
@@ -54,8 +53,8 @@ NUM_RESOLUTION_LEVELS = 4
 # Saliency smoothness parameter
 # -------------------------------------------------
 # β controls the contribution of the saliency
-# smoothness term in the formulation.
-BETA = 0.1
+# smoothness term.
+BETA = 0.10
 
 # -------------------------------------------------
 # Regularization parameter
@@ -67,7 +66,8 @@ LAMBDA_REG = 1e-4
 # Confidence penalty parameter
 # -------------------------------------------------
 # λ2 controls the confidence-related penalty.
-LAMBDA_CONF = 1e-3
+# Value reported in the revised manuscript.
+LAMBDA_CONF = 0.10
 
 
 # =================================================
@@ -137,4 +137,3 @@ LOG_INTERVAL = 10
 # =================================================
 
 SEED = 42
-```
